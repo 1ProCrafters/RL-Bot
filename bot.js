@@ -8,12 +8,13 @@ const path = require('path');
 const SERVER_CONFIG = {
     host: 'localhost',
     port: 25565,
-    version: '1.20.1' // Adjust to your server version
+    version: '1.19.4' // Adjust to your server version
 };
 
 const TRAINING_CONFIG = {
-    numBots: 2,
-    episodesPerSession: 100,
+    numBots: 50,
+    connectDelay: 10,
+    episodesPerSession: 1000,
     maxStepsPerEpisode: 600,
     learningRate: 0.01,
     discountFactor: 0.99,
@@ -764,7 +765,7 @@ class TrainingSystem {
         for (let i = 0; i < TRAINING_CONFIG.numBots; i++) {
             const bot = new PvPBot(`Fighter${i + 1}`, TRAINING_CONFIG, this.agent);
             await bot.connect();
-            await new Promise(resolve => setTimeout(resolve, 1000));
+            await new Promise(resolve => setTimeout(resolve, TRAINING_CONFIG.connectDelay));
             this.bots.push(bot);
         }
 

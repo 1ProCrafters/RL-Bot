@@ -14,6 +14,7 @@ const SERVER_CONFIG = {
 
 const TRAINING_CONFIG = {
     numBots: 10,
+    numOperators: 2, // Number of operator bots to use
     connectDelay: 100,
     episodesPerSession: 100,
     maxStepsPerEpisode: 600,
@@ -61,9 +62,9 @@ const TRAINING_CONFIG = {
 };
 
 const ARENA_CONFIG = {
-    center: { x: 0, y: 65, z: 0 },
+    center: { x: 0, y: -60, z: 0 },
     size: 15,
-    respawnY: 68
+    respawnY: -57
 };
 
 // ==================== NEURAL NETWORK ====================
@@ -355,6 +356,7 @@ class PvPBot {
         this.name = name;
         this.config = config;
         this.agent = agent;
+        this.operator = null; // Will be assigned by TrainingSystem
         this.bot = null;
         this.opponent = null;
         this.arenaIndex = arenaIndex;
@@ -391,6 +393,10 @@ class PvPBot {
             this.bot.once('error', reject);
             this.bot.once('kicked', (reason) => reject(new Error(reason)));
         });
+    }
+
+    setOperator(operator) {
+        this.operator = operator;
     }
 
     setupEventHandlers() {
@@ -720,7 +726,7 @@ class OperatorBot {
 // ==================== TRAINING SYSTEM ====================
 class TrainingSystem {
     constructor(loadModel = false) {
-        this.operator = new OperatorBot();
+        this.operators = [];
         this.agent = loadModel ? this.loadAgent() : new RLAgent(TRAINING_CONFIG);
         this.bots = [];
         this.episode = 0;
@@ -794,12 +800,21 @@ class TrainingSystem {
     async initialize() {
         console.log('Initializing training system...');
 
-        // Connect operator
-        await this.operator.connect();
-        await new Promise(resolve => setTimeout(resolve, 2000));
+        // Connect operators
+        for (let i = 0; i < TRAINING_CONFIG.numOperators; i++) {
+            const operator = new OperatorBot();
+            // We need to give each operator a unique name
+            operator.bot = mineflayer.createBot({
+                ...SERVER_CONFIG,
+                username: `Operator${i + 1}`
+            });
+            await new Promise(resolve => operator.bot.once('spawn', resolve));
+            console.log(`Operator${i + 1} connected!`);
+            this.operators.push(operator);
+        }
 
-        // Setup arena
-        await this.operator.setupArena();
+        // Setup arenas, distributing the work
+        await this.setupArenas();
         await new Promise(resolve => setTimeout(resolve, 1000));
 
         if (TRAINING_CONFIG.numBots % TRAINING_CONFIG.botsPerArena !== 0) {
@@ -809,7 +824,9 @@ class TrainingSystem {
         // Create and connect bots
         for (let i = 0; i < TRAINING_CONFIG.numBots; i++) {
             const arenaIndex = Math.floor(i / TRAINING_CONFIG.botsPerArena);
+            const assignedOperator = this.operators[arenaIndex % this.operators.length];
             const bot = new PvPBot(`Fighter${i + 1}`, TRAINING_CONFIG, this.agent, arenaIndex);
+            bot.setOperator(assignedOperator);
             await bot.connect();
             await new Promise(resolve => setTimeout(resolve, TRAINING_CONFIG.connectDelay));
             this.bots.push(bot);
@@ -824,6 +841,43 @@ class TrainingSystem {
         console.log('Training system initialized!');
     }
 
+    async setupArenas() {
+        const numArenas = Math.ceil(TRAINING_CONFIG.numBots / TRAINING_CONFIG.botsPerArena);
+        console.log(`Setting up ${numArenas} arena(s) using ${this.operators.length} operators...`);
+
+        const setupPromises = [];
+        for (let i = 0; i < numArenas; i++) {
+            const operator = this.operators[i % this.operators.length];
+            setupPromises.push(this.setupSingleArena(operator, i));
+        }
+        await Promise.all(setupPromises);
+
+        // Use the primary operator for global settings
+        const primaryOperator = this.operators[0];
+        await primaryOperator.executeCommand('/time set day');
+        await primaryOperator.executeCommand('/weather clear');
+        await primaryOperator.executeCommand('/gamerule doDaylightCycle false');
+        await primaryOperator.executeCommand('/gamerule doMobSpawning false');
+        await primaryOperator.executeCommand('/gamerule playersSleepingPercentage 0');
+
+        console.log('Arena setup complete!');
+    }
+
+    async setupSingleArena(operator, arenaIndex) {
+        const size = ARENA_CONFIG.size;
+        const arenaX = ARENA_CONFIG.center.x + arenaIndex * TRAINING_CONFIG.arenaSpacing;
+        const { y, z } = ARENA_CONFIG.center;
+
+        console.log(`  - ${operator.bot.username} creating arena ${arenaIndex + 1} at x=${arenaX}`);
+
+        await operator.executeCommand(`/fill ${arenaX - size} ${y - 5} ${z - size} ${arenaX + size} ${y + 20} ${z + size} air`);
+        await operator.executeCommand(`/fill ${arenaX - size} ${y - 1} ${z - size} ${arenaX + size} ${y - 1} ${z + size} stone`);
+        await operator.executeCommand(`/fill ${arenaX - size} ${y} ${z - size} ${arenaX - size} ${y + 5} ${z + size} barrier`);
+        await operator.executeCommand(`/fill ${arenaX + size} ${y} ${z - size} ${arenaX + size} ${y + 5} ${z + size} barrier`);
+        await operator.executeCommand(`/fill ${arenaX - size} ${y} ${z - size} ${arenaX + size} ${y + 5} ${z - size} barrier`);
+        await operator.executeCommand(`/fill ${arenaX - size} ${y} ${z + size} ${arenaX + size} ${y + 5} ${z + size} barrier`);
+    }
+
     async runEpisode() {
         this.episode++;
         this.totalEpisodes++;
@@ -831,16 +885,14 @@ class TrainingSystem {
         console.log(`🎮 Episode ${this.totalEpisodes} (Session: ${this.episode}/${TRAINING_CONFIG.episodesPerSession})`);
         console.log(`${'='.repeat(60)}`);
 
-        await this.operator.executeCommand(`/kill @e[type=item]`);
-
         // Reset bots
         for (const bot of this.bots) {
             bot.resetEpisode();
-            await this.operator.healPlayer(bot.name);
-            await this.operator.giveEquipment(bot.name);
+            await bot.operator.healPlayer(bot.name);
+            await bot.operator.giveEquipment(bot.name);
             const spawnX = (Math.random() - 0.5) * (ARENA_CONFIG.size - 2);
             const spawnZ = (Math.random() - 0.5) * (ARENA_CONFIG.size - 2); // This line was correct, but the next one was missing the arenaIndex
-            await this.operator.teleportPlayer(bot.name, spawnX, ARENA_CONFIG.respawnY, spawnZ, bot.arenaIndex);
+            await bot.operator.teleportPlayer(bot.name, spawnX, ARENA_CONFIG.respawnY, spawnZ, bot.arenaIndex);
         }
 
         await new Promise(resolve => setTimeout(resolve, 3000));
@@ -1011,7 +1063,9 @@ class TrainingSystem {
                 } catch (e) { }
             }
         }
-        this.operator.disconnect();
+        for (const operator of this.operators) {
+            operator.disconnect();
+        }
     }
 }
 
@@ -1043,6 +1097,7 @@ Configuration:
   Edit TRAINING_CONFIG at the top of the file to adjust:
   
   Training:
+    - numOperators: ${TRAINING_CONFIG.numOperators}
     - episodesPerSession: ${TRAINING_CONFIG.episodesPerSession}
     - saveInterval: ${TRAINING_CONFIG.saveInterval} (saves every N episodes)
     - modelPath: ${TRAINING_CONFIG.modelPath}
@@ -1065,7 +1120,7 @@ Server:
   - Port: ${SERVER_CONFIG.port}
   - Version: ${SERVER_CONFIG.version}
 
-Note: The Operator bot must have OP permissions on the server!
+Note: All Operator bots must have OP permissions on the server!
     `);
         process.exit(0);
     }

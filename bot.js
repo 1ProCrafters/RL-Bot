@@ -3,18 +3,19 @@ const { pathfinder, Movements, goals } = require('mineflayer-pathfinder');
 const { GoalNear, GoalBlock, GoalXZ, GoalY, GoalInvert, GoalFollow } = goals;
 const fs = require('fs');
 const path = require('path');
+const { connect } = require('http2');
 
 // ==================== CONFIGURATION ====================
 const SERVER_CONFIG = {
     host: 'localhost',
     port: 25565,
-    version: '1.19.4' // Adjust to your server version
+    version: '1.19.4'
 };
 
 const TRAINING_CONFIG = {
-    numBots: 50,
-    connectDelay: 10,
-    episodesPerSession: 1000,
+    numBots: 10,
+    connectDelay: 100,
+    episodesPerSession: 100,
     maxStepsPerEpisode: 600,
     learningRate: 0.01,
     discountFactor: 0.99,
@@ -32,22 +33,37 @@ const TRAINING_CONFIG = {
     rewardFarAway: -0.5, // Penalty for being too far
 
     // Training
-    saveInterval: 5, // Save model every N episodes
-    modelPath: './models/pvp_model.json',
+    saveInterval: 10, // Save model every N episodes
+    modelPath: './model/pvp_model.json',
     logInterval: 1, // Log stats every N episodes
     targetNetworkUpdateInterval: 5,
     batchSize: 32,
     minMemorySize: 50,
 
+    // Genetic Algorithm / Evolution
+    enableEvolution: true, // Enable evolutionary training
+    evolutionInterval: 20, // Every N episodes, evolve the population
+    mutationRate: 0.1, // Probability of mutating each weight
+    mutationStrength: 0.2, // How much to mutate weights by
+
+    // Fitness metric formula (customize this!)
+    // Available variables: kills, deaths, damageDealt, damageTaken, avgReward
+    // Example: "kills - deaths * 0.5 + damageDealt * 0.1"
+    fitnessFormula: "kills * 100 - deaths * 50 + damageDealt * 2 - damageTaken * 1",
+
     // Combat
     attackCooldown: 500, // ms between attacks
     optimalDistance: 3.5, // Optimal attack distance
+
+    // Arena scaling
+    botsPerArena: 2, // How many bots fight in each arena (must be 2 for now)
+    arenaSpacing: 30, // Distance between arenas for multiple bot pairs
 };
 
 const ARENA_CONFIG = {
     center: { x: 0, y: 65, z: 0 },
     size: 15,
-    respawnY: 70
+    respawnY: 68
 };
 
 // ==================== NEURAL NETWORK ====================
@@ -335,12 +351,13 @@ class RLAgent {
 
 // ==================== PVP BOT ====================
 class PvPBot {
-    constructor(name, config, agent) {
+    constructor(name, config, agent, arenaIndex = 0) {
         this.name = name;
         this.config = config;
         this.agent = agent;
         this.bot = null;
         this.opponent = null;
+        this.arenaIndex = arenaIndex;
         this.currentState = null;
         this.currentAction = null;
         this.episodeReward = 0;
@@ -428,8 +445,10 @@ class PvPBot {
     }
 
     async respawn() {
-        this.bot.chat(`/tp ${this.name} ${ARENA_CONFIG.center.x} ${ARENA_CONFIG.respawnY} ${ARENA_CONFIG.center.z}`);
+        const arenaCenter = this.getArenaCenter();
+        this.bot.chat(`/tp ${this.name} ${arenaCenter.x} ${ARENA_CONFIG.respawnY} ${arenaCenter.z}`);
         this.lastHealth = 20;
+        this.lastOpponentHealth = 20;
     }
 
     setOpponent(opponent) {
@@ -577,6 +596,14 @@ class PvPBot {
         this.lastAttackTime = 0;
     }
 
+    getArenaCenter() {
+        return {
+            x: ARENA_CONFIG.center.x + this.arenaIndex * TRAINING_CONFIG.arenaSpacing,
+            y: ARENA_CONFIG.center.y,
+            z: ARENA_CONFIG.center.z
+        };
+    }
+
     getStats() {
         return {
             name: this.name,
@@ -616,28 +643,37 @@ class OperatorBot {
     }
 
     async setupArena() {
-        console.log('Setting up arena...');
+        const numArenas = Math.ceil(TRAINING_CONFIG.numBots / TRAINING_CONFIG.botsPerArena);
+        console.log(`Setting up ${numArenas} arena(s)...`);
 
-        const { x, y, z } = ARENA_CONFIG.center;
         const size = ARENA_CONFIG.size;
 
-        // Clear area
-        await this.executeCommand(`/fill ${x - size} ${y - 5} ${z - size} ${x + size} ${y + 20} ${z + size} air`);
+        for (let i = 0; i < numArenas; i++) {
+            const arenaX = ARENA_CONFIG.center.x + i * TRAINING_CONFIG.arenaSpacing;
+            const { y, z } = ARENA_CONFIG.center;
 
-        // Create floor
-        await this.executeCommand(`/fill ${x - size} ${y - 1} ${z - size} ${x + size} ${y - 1} ${z + size} stone`);
+            console.log(`  - Creating arena ${i + 1} at x=${arenaX}`);
 
-        // Create walls
-        await this.executeCommand(`/fill ${x - size} ${y} ${z - size} ${x - size} ${y + 5} ${z + size} barrier`);
-        await this.executeCommand(`/fill ${x + size} ${y} ${z - size} ${x + size} ${y + 5} ${z + size} barrier`);
-        await this.executeCommand(`/fill ${x - size} ${y} ${z - size} ${x + size} ${y + 5} ${z - size} barrier`);
-        await this.executeCommand(`/fill ${x - size} ${y} ${z + size} ${x + size} ${y + 5} ${z + size} barrier`);
+            // Clear area
+            await this.executeCommand(`/fill ${arenaX - size} ${y - 5} ${z - size} ${arenaX + size} ${y + 20} ${z + size} air`);
+            await new Promise(resolve => setTimeout(resolve, 100));
+
+            // Create floor
+            await this.executeCommand(`/fill ${arenaX - size} ${y - 1} ${z - size} ${arenaX + size} ${y - 1} ${z + size} stone`);
+
+            // Create walls
+            await this.executeCommand(`/fill ${arenaX - size} ${y} ${z - size} ${arenaX - size} ${y + 5} ${z + size} barrier`);
+            await this.executeCommand(`/fill ${arenaX + size} ${y} ${z - size} ${arenaX + size} ${y + 5} ${z + size} barrier`);
+            await this.executeCommand(`/fill ${arenaX - size} ${y} ${z - size} ${arenaX + size} ${y + 5} ${z - size} barrier`);
+            await this.executeCommand(`/fill ${arenaX - size} ${y} ${z + size} ${arenaX + size} ${y + 5} ${z + size} barrier`);
+        }
 
         // Set time and weather
         await this.executeCommand('/time set day');
         await this.executeCommand('/weather clear');
         await this.executeCommand('/gamerule doDaylightCycle false');
         await this.executeCommand('/gamerule doMobSpawning false');
+        await this.executeCommand('/gamerule playersSleepingPercentage 0');
 
         console.log('Arena setup complete!');
     }
@@ -658,8 +694,13 @@ class OperatorBot {
         await this.executeCommand(`/effect give ${playerName} saturation 1 10`);
     }
 
-    async teleportPlayer(playerName, x, y, z) {
-        await this.executeCommand(`/tp ${playerName} ${x} ${y} ${z}`);
+    async teleportPlayer(playerName, x, y, z, arenaIndex = 0) {
+        const arenaXOffset = arenaIndex * TRAINING_CONFIG.arenaSpacing;
+        const finalX = ARENA_CONFIG.center.x + arenaXOffset + x;
+        const finalY = y;
+        const finalZ = ARENA_CONFIG.center.z + z;
+
+        await this.executeCommand(`/tp ${playerName} ${finalX} ${finalY} ${finalZ}`);
     }
 
     async executeCommand(command) {
@@ -761,18 +802,23 @@ class TrainingSystem {
         await this.operator.setupArena();
         await new Promise(resolve => setTimeout(resolve, 1000));
 
+        if (TRAINING_CONFIG.numBots % TRAINING_CONFIG.botsPerArena !== 0) {
+            throw new Error('`numBots` must be a multiple of `botsPerArena`.');
+        }
+
         // Create and connect bots
         for (let i = 0; i < TRAINING_CONFIG.numBots; i++) {
-            const bot = new PvPBot(`Fighter${i + 1}`, TRAINING_CONFIG, this.agent);
+            const arenaIndex = Math.floor(i / TRAINING_CONFIG.botsPerArena);
+            const bot = new PvPBot(`Fighter${i + 1}`, TRAINING_CONFIG, this.agent, arenaIndex);
             await bot.connect();
             await new Promise(resolve => setTimeout(resolve, TRAINING_CONFIG.connectDelay));
             this.bots.push(bot);
         }
 
-        // Set opponents
-        for (let i = 0; i < this.bots.length; i++) {
-            const opponent = this.bots[(i + 1) % this.bots.length];
-            this.bots[i].setOpponent(opponent);
+        // Set opponents within each arena
+        for (let i = 0; i < this.bots.length; i += 2) {
+            this.bots[i].setOpponent(this.bots[i + 1]);
+            this.bots[i + 1].setOpponent(this.bots[i]);
         }
 
         console.log('Training system initialized!');
@@ -785,14 +831,16 @@ class TrainingSystem {
         console.log(`🎮 Episode ${this.totalEpisodes} (Session: ${this.episode}/${TRAINING_CONFIG.episodesPerSession})`);
         console.log(`${'='.repeat(60)}`);
 
+        await this.operator.executeCommand(`/kill @e[type=item]`);
+
         // Reset bots
         for (const bot of this.bots) {
             bot.resetEpisode();
             await this.operator.healPlayer(bot.name);
             await this.operator.giveEquipment(bot.name);
-            const spawnX = ARENA_CONFIG.center.x + (Math.random() - 0.5) * 8;
-            const spawnZ = ARENA_CONFIG.center.z + (Math.random() - 0.5) * 8;
-            await this.operator.teleportPlayer(bot.name, spawnX, ARENA_CONFIG.respawnY, spawnZ);
+            const spawnX = (Math.random() - 0.5) * (ARENA_CONFIG.size - 2);
+            const spawnZ = (Math.random() - 0.5) * (ARENA_CONFIG.size - 2); // This line was correct, but the next one was missing the arenaIndex
+            await this.operator.teleportPlayer(bot.name, spawnX, ARENA_CONFIG.respawnY, spawnZ, bot.arenaIndex);
         }
 
         await new Promise(resolve => setTimeout(resolve, 3000));
@@ -800,24 +848,32 @@ class TrainingSystem {
         // Run episode
         const episodeStartTime = Date.now();
         let steps = 0;
-        let winner = null;
+        const activeArenas = new Set(this.bots.map(b => b.arenaIndex));
 
         while (steps < TRAINING_CONFIG.maxStepsPerEpisode) {
             for (const bot of this.bots) {
-                await bot.step();
+                // Only step if the bot's arena is still active
+                if (activeArenas.has(bot.arenaIndex)) {
+                    await bot.step();
+                }
             }
             await new Promise(resolve => setTimeout(resolve, 50));
             steps++;
 
-            // Check for winner
-            for (const bot of this.bots) {
-                if (bot.bot && bot.bot.health <= 0) {
-                    winner = this.bots.find(b => b !== bot);
-                    break;
+            // Check for finished fights in each arena
+            const finishedArenas = new Set();
+            for (const arenaIndex of activeArenas) {
+                const botsInArena = this.bots.filter(b => b.arenaIndex === arenaIndex);
+                if (botsInArena.some(b => b.bot && b.bot.health <= 0)) {
+                    finishedArenas.add(arenaIndex);
                 }
             }
 
-            if (winner) break;
+            for (const arenaIndex of finishedArenas) {
+                activeArenas.delete(arenaIndex);
+            }
+
+            if (activeArenas.size === 0) break;
         }
 
         const episodeDuration = (Date.now() - episodeStartTime) / 1000;
@@ -843,16 +899,13 @@ class TrainingSystem {
 
         // Print stats
         if (this.episode % TRAINING_CONFIG.logInterval === 0) {
-            this.printDetailedStats(episodeDuration, steps, winner);
+            this.printDetailedStats(episodeDuration, steps);
         } else {
             console.log(`⏱️  Duration: ${episodeDuration.toFixed(1)}s | Steps: ${steps} | Avg Reward: ${totalReward.toFixed(1)} | ε: ${this.agent.epsilon.toFixed(4)}`);
-            if (winner) {
-                console.log(`🏆 Winner: ${winner.name}`);
-            }
         }
     }
 
-    printDetailedStats(lastEpisodeDuration, steps, winner) {
+    printDetailedStats(lastEpisodeDuration, steps) {
         console.log('\n' + '='.repeat(60));
         console.log('📊 DETAILED STATISTICS');
         console.log('='.repeat(60));
@@ -895,10 +948,6 @@ class TrainingSystem {
             console.log(`      Hits: ${stats.hits}`);
             console.log(`      Damage: ${stats.damageDealt} dealt / ${stats.damageTaken} taken`);
             console.log(`      Last Reward: ${stats.lastReward}`);
-        }
-
-        if (winner) {
-            console.log(`\n🏆 Episode Winner: ${winner.name}`);
         }
 
         // All-time best

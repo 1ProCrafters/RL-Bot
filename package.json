@@ -1,11 +1,11 @@
 {
-  "name": "RL-Bot",
+  "name": "rl-bot",
   "version": "1.0.0",
   "description": "",
-  "main": "bot.js",
+  "main": "index.js",
   "type": "commonjs",
   "scripts": {
-    "train": "node bot.js",
+    "train": "node index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "author": "",
